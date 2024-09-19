@@ -1,0 +1,106 @@
+# Import the CSV file
+$csvData = Import-Csv -Path "path_to_your_file.csv"
+
+# Filter rows where username has exactly 5 characters, contains both letters and numbers
+$filteredData = $csvData | Where-Object { 
+    $_.username.Length -eq 5 -and $_.username -match '^(?=.*[a-zA-Z])(?=.*[0-9])[a-zA-Z0-9]+$' 
+}
+
+# Initialize a hashtable to cache AD lookup results
+$adCache = @{}
+
+# Create an empty array to store processed results
+$processedData = @()
+
+# Batch size to reduce AD lookup calls
+$batchSize = 1000
+
+# Process data in batches
+$filteredData | ForEach-Object -Begin {
+    $batch = @()
+} -Process {
+    $batch += $_
+
+    if ($batch.Count -ge $batchSize) {
+        # Get distinct usernames for batch AD lookup
+        $usernames = $batch | Select-Object -ExpandProperty username -Unique
+
+        # Check for any uncached usernames
+        $uncachedUsernames = $usernames | Where-Object { -not $adCache.ContainsKey($_) }
+
+        if ($uncachedUsernames.Count -gt 0) {
+            # Construct the filter string
+            $filterString = ($uncachedUsernames | ForEach-Object { "SamAccountName -eq '$_'" }) -join ' -or '
+            
+            # Perform the bulk AD lookup
+            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname -ErrorAction SilentlyContinue | 
+                        Select-Object SamAccountName, GivenName, Surname
+
+            # Store results in the cache
+            foreach ($user in $adUsers) {
+                $adCache[$user.SamAccountName] = "$($user.GivenName) $($user.Surname)"
+            }
+
+            # Mark users not found in AD
+            foreach ($username in $uncachedUsernames) {
+                if (-not $adCache.ContainsKey($username)) {
+                    $adCache[$username] = "User not found in AD"
+                }
+            }
+        }
+
+        # Process the batch
+        foreach ($row in $batch) {
+            $fullName = $adCache[$row.username]
+
+            $processedData += [PSCustomObject]@{
+                Username   = $row.username
+                Action     = $row.action
+                Time       = $row.time
+                FullName   = $fullName
+            }
+        }
+
+        # Reset the batch
+        $batch = @()
+    }
+} -End {
+    # Process remaining data in the batch
+    if ($batch.Count -gt 0) {
+        $usernames = $batch | Select-Object -ExpandProperty username -Unique
+        $uncachedUsernames = $usernames | Where-Object { -not $adCache.ContainsKey($_) }
+
+        if ($uncachedUsernames.Count -gt 0) {
+            $filterString = ($uncachedUsernames | ForEach-Object { "SamAccountName -eq '$_'" }) -join ' -or '
+            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname -ErrorAction SilentlyContinue |
+                        Select-Object SamAccountName, GivenName, Surname
+
+            foreach ($user in $adUsers) {
+                $adCache[$user.SamAccountName] = "$($user.GivenName) $($user.Surname)"
+            }
+
+            foreach ($username in $uncachedUsernames) {
+                if (-not $adCache.ContainsKey($username)) {
+                    $adCache[$username] = "User not found in AD"
+                }
+            }
+        }
+
+        foreach ($row in $batch) {
+            $fullName = $adCache[$row.username]
+
+            $processedData += [PSCustomObject]@{
+                Username   = $row.username
+                Action     = $row.action
+                Time       = $row.time
+                FullName   = $fullName
+            }
+        }
+    }
+}
+
+# Export the result to a new CSV file
+$processedData | Export-Csv -Path "path_to_output_file.csv" -NoTypeInformation
+
+# Output result to console for verification
+$processedData
