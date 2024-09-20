@@ -7,7 +7,7 @@ $filteredData = $csvData | Where-Object {
 }
 
 # Initialize a hashtable to cache AD lookup results
-$adCache = @{}
+$adCache = @{ }
 
 # Create an empty array to store processed results
 $processedData = @()
@@ -32,32 +32,45 @@ $filteredData | ForEach-Object -Begin {
             # Construct the filter string
             $filterString = ($uncachedUsernames | ForEach-Object { "SamAccountName -eq '$_'" }) -join ' -or '
             
-            # Perform the bulk AD lookup
-            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname -ErrorAction SilentlyContinue | 
-                        Select-Object SamAccountName, GivenName, Surname
+            # Perform the bulk AD lookup with additional properties: Division, Department, Branch
+            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname, Division, Department, Branch -ErrorAction SilentlyContinue | 
+                        Select-Object SamAccountName, GivenName, Surname, Division, Department, Branch
 
             # Store results in the cache
             foreach ($user in $adUsers) {
-                $adCache[$user.SamAccountName] = "$($user.GivenName) $($user.Surname)"
+                $adCache[$user.SamAccountName] = @{
+                    FullName   = "$($user.GivenName) $($user.Surname)"
+                    Division   = $user.Division
+                    Department = $user.Department
+                    Branch     = $user.Branch
+                }
             }
 
             # Mark users not found in AD
             foreach ($username in $uncachedUsernames) {
                 if (-not $adCache.ContainsKey($username)) {
-                    $adCache[$username] = "User not found in AD"
+                    $adCache[$username] = @{
+                        FullName   = "User not found in AD"
+                        Division   = "N/A"
+                        Department = "N/A"
+                        Branch     = "N/A"
+                    }
                 }
             }
         }
 
         # Process the batch
         foreach ($row in $batch) {
-            $fullName = $adCache[$row.username]
+            $adInfo = $adCache[$row.username]
 
             $processedData += [PSCustomObject]@{
                 Username   = $row.username
                 Action     = $row.action
                 Time       = $row.time
-                FullName   = $fullName
+                FullName   = $adInfo.FullName
+                Division   = $adInfo.Division
+                Department = $adInfo.Department
+                Branch     = $adInfo.Branch
             }
         }
 
@@ -72,28 +85,41 @@ $filteredData | ForEach-Object -Begin {
 
         if ($uncachedUsernames.Count -gt 0) {
             $filterString = ($uncachedUsernames | ForEach-Object { "SamAccountName -eq '$_'" }) -join ' -or '
-            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname -ErrorAction SilentlyContinue |
-                        Select-Object SamAccountName, GivenName, Surname
+            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname, Division, Department, Branch -ErrorAction SilentlyContinue |
+                        Select-Object SamAccountName, GivenName, Surname, Division, Department, Branch
 
             foreach ($user in $adUsers) {
-                $adCache[$user.SamAccountName] = "$($user.GivenName) $($user.Surname)"
+                $adCache[$user.SamAccountName] = @{
+                    FullName   = "$($user.GivenName) $($user.Surname)"
+                    Division   = $user.Division
+                    Department = $user.Department
+                    Branch     = $user.Branch
+                }
             }
 
             foreach ($username in $uncachedUsernames) {
                 if (-not $adCache.ContainsKey($username)) {
-                    $adCache[$username] = "User not found in AD"
+                    $adCache[$username] = @{
+                        FullName   = "User not found in AD"
+                        Division   = "N/A"
+                        Department = "N/A"
+                        Branch     = "N/A"
+                    }
                 }
             }
         }
 
         foreach ($row in $batch) {
-            $fullName = $adCache[$row.username]
+            $adInfo = $adCache[$row.username]
 
             $processedData += [PSCustomObject]@{
                 Username   = $row.username
                 Action     = $row.action
                 Time       = $row.time
-                FullName   = $fullName
+                FullName   = $adInfo.FullName
+                Division   = $adInfo.Division
+                Department = $adInfo.Department
+                Branch     = $adInfo.Branch
             }
         }
     }
