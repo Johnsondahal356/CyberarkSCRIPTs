@@ -32,17 +32,27 @@ $filteredData | ForEach-Object -Begin {
             # Construct the filter string
             $filterString = ($uncachedUsernames | ForEach-Object { "SamAccountName -eq '$_'" }) -join ' -or '
             
-            # Perform the bulk AD lookup with additional properties: Division, Department, Branch
-            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname, Division, Department, Branch -ErrorAction SilentlyContinue | 
-                        Select-Object SamAccountName, GivenName, Surname, Division, Department, Branch
+            # Perform the bulk AD lookup with additional properties: Division, Department, Branch, and Manager
+            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname, Division, Department, Branch, Manager -ErrorAction SilentlyContinue | 
+                        Select-Object SamAccountName, GivenName, Surname, Division, Department, Branch, Manager
 
             # Store results in the cache
             foreach ($user in $adUsers) {
+                $managerName = ""
+                if ($user.Manager) {
+                    # Fetch manager's name if the user has a manager
+                    $manager = Get-ADUser -Identity $user.Manager -Properties GivenName, Surname -ErrorAction SilentlyContinue
+                    if ($manager) {
+                        $managerName = "$($manager.GivenName) $($manager.Surname)"
+                    }
+                }
+
                 $adCache[$user.SamAccountName] = @{
                     FullName   = "$($user.GivenName) $($user.Surname)"
                     Division   = $user.Division
                     Department = $user.Department
                     Branch     = $user.Branch
+                    Manager    = if ($managerName) { $managerName } else { "Manager not found" }
                 }
             }
 
@@ -50,10 +60,12 @@ $filteredData | ForEach-Object -Begin {
             foreach ($username in $uncachedUsernames) {
                 if (-not $adCache.ContainsKey($username)) {
                     $adCache[$username] = @{
+
                         FullName   = "User not found in AD"
                         Division   = "N/A"
                         Department = "N/A"
                         Branch     = "N/A"
+                        Manager    = "N/A"
                     }
                 }
             }
@@ -71,6 +83,7 @@ $filteredData | ForEach-Object -Begin {
                 Division   = $adInfo.Division
                 Department = $adInfo.Department
                 Branch     = $adInfo.Branch
+                Manager    = $adInfo.Manager
             }
         }
 
@@ -85,15 +98,25 @@ $filteredData | ForEach-Object -Begin {
 
         if ($uncachedUsernames.Count -gt 0) {
             $filterString = ($uncachedUsernames | ForEach-Object { "SamAccountName -eq '$_'" }) -join ' -or '
-            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname, Division, Department, Branch -ErrorAction SilentlyContinue |
-                        Select-Object SamAccountName, GivenName, Surname, Division, Department, Branch
+            $adUsers = Get-ADUser -Filter $filterString -Property GivenName, Surname, Division, Department, Branch, Manager -ErrorAction SilentlyContinue |
+                        Select-Object SamAccountName, GivenName, Surname, Division, Department, Branch, Manager
 
             foreach ($user in $adUsers) {
+                $managerName = ""
+                if ($user.Manager) {
+                    # Fetch manager's name if the user has a manager
+                    $manager = Get-ADUser -Identity $user.Manager -Properties GivenName, Surname -ErrorAction SilentlyContinue
+                    if ($manager) {
+                        $managerName = "$($manager.GivenName) $($manager.Surname)"
+                    }
+                }
+
                 $adCache[$user.SamAccountName] = @{
                     FullName   = "$($user.GivenName) $($user.Surname)"
                     Division   = $user.Division
                     Department = $user.Department
                     Branch     = $user.Branch
+                    Manager    = if ($managerName) { $managerName } else { "Manager not found" }
                 }
             }
 
@@ -104,6 +127,7 @@ $filteredData | ForEach-Object -Begin {
                         Division   = "N/A"
                         Department = "N/A"
                         Branch     = "N/A"
+                        Manager    = "N/A"
                     }
                 }
             }
@@ -120,6 +144,7 @@ $filteredData | ForEach-Object -Begin {
                 Division   = $adInfo.Division
                 Department = $adInfo.Department
                 Branch     = $adInfo.Branch
+                Manager    = $adInfo.Manager
             }
         }
     }
