@@ -1,0 +1,61 @@
+function Remove-ADUserAndGroups {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Username
+    )
+
+    # Import the Active Directory module
+    Import-Module ActiveDirectory
+
+    try {
+        # Check if the user exists
+        $user = Get-ADUser -Filter "SamAccountName -eq '$Username'" -ErrorAction Stop
+        Write-Host "User '$Username' found."
+
+        try {
+            # Delete the user
+            Remove-ADUser -Identity $user.SamAccountName -Confirm:$false
+            Write-Host "User '$Username' deleted successfully."
+        } catch {
+            Write-Warning "Failed to delete user '$Username': $_"
+            return
+        }
+
+        # Check if the username ends with .lower or .upper
+        if ($Username -like "*.lower") {
+            $groupName = $Username.Replace('.', '_')
+            Write-Host "Checking for group '$groupName'..."
+            try {
+                $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+                try {
+                    # Delete the group
+                    Remove-ADGroup -Identity $groupName -Confirm:$false
+                    Write-Host "Group '$groupName' deleted successfully."
+                } catch {
+                    Write-Warning "Failed to delete group '$groupName': $_"
+                }
+            } catch {
+                Write-Warning "Group '$groupName' does not exist or could not be retrieved: $_"
+            }
+        } elseif ($Username -like "*.upper") {
+            $groupName = $Username.Replace('.', '_')
+            Write-Host "Checking for group '$groupName'..."
+            try {
+                $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+                try {
+                    # Delete the group
+                    Remove-ADGroup -Identity $groupName -Confirm:$false
+                    Write-Host "Group '$groupName' deleted successfully."
+                } catch {
+                    Write-Warning "Failed to delete group '$groupName': $_"
+                }
+            } catch {
+                Write-Warning "Group '$groupName' does not exist or could not be retrieved: $_"
+            }
+        } else {
+            Write-Host "Username does not end with .lower or .upper. No group checks needed."
+        }
+    } catch {
+        Write-Warning "User '$Username' does not exist or an error occurred: $_"
+    }
+}
