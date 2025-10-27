@@ -1,0 +1,51 @@
+# Input CSV path
+$InputCsv = "C:\Temp\Safes.csv"
+
+# Output CSV path
+$OutputCsv = "C:\Temp\SafeGroupReport.csv"
+
+# Import CSV
+$csvData = Import-Csv -Path $InputCsv
+
+# Get unique safenames for lookup
+$uniqueSafes = $csvData.SafeName | Sort-Object -Unique
+
+# Hashtable to cache owners
+$ownerLookup = @{}
+
+foreach ($safeName in $uniqueSafes) {
+   
+
+    # Try to find matching AD group(s)
+    $adGroup = Get-ADGroup -Filter "Name -like '$groupPattern'" -Properties ManagedBy -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if ($adGroup) {
+        if ($adGroup.ManagedBy) {
+            try {
+                $owner = (Get-ADUser -Identity $adGroup.ManagedBy -ErrorAction Stop).SamAccountName
+            } catch {
+                $owner = "No owner"
+            }
+        } else {
+            $owner = "No owner"
+        }
+    } else {
+        $owner = "No owner"
+    }
+
+    # Store owner info for reuse
+    $ownerLookup[$safeName] = $owner
+}
+
+# Now create final output based on original rows
+$results = foreach ($row in $csvData) {
+    [PSCustomObject]@{
+        SafeName        = $row.SafeName
+        OwnerSAMAccount = $ownerLookup[$row.SafeName]
+    }
+}
+
+# Export final results
+$results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "Report generated: $OutputCsv"
