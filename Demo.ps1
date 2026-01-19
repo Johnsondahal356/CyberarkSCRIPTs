@@ -1,28 +1,53 @@
-function Get-SafeNameOwners {
+function Get-CyberArkSafeOwnersEnriched {
+
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [array]$AllAccounts,
 
-        [Parameter(Mandatory=$false)]
-        [string]$OutputCsvPath = "C:\temp\SafeNameOwners.csv"
+        [Parameter(Mandatory = $false)]
+        [string]$OutputCsvPath = "C:\temp\FinalSafeOwners.csv",
+
+        [Parameter(Mandatory = $false)]
+        [string]$CyberArkBaseURI = "https://cyberark.company.com"
     )
 
-    # Hashtable to cache owners per SafeName
+    Write-Host "[INFO] Loading required modules..."
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Import-Module PSPAS -ErrorAction Stop
+
+    # ==============================
+    # CYBERARK SESSION
+    # ==============================
+
+    Write-Host "[INFO] Connecting to CyberArk..."
+    New-PASSession -BaseURI $CyberArkBaseURI `
+                   -Credential (Get-Credential) `
+                   -Type RADIUS
+
+    # ==============================
+    # SAFE OWNER RESOLUTION (AD)
+    # ==============================
+
+    Write-Host "[INFO] Resolving Safe owners using AD..."
+
     $safeOwnerMap = @{}
     $errorLog = @()
 
-    # Get unique SafeNames
     $uniqueSafes = $AllAccounts | Select-Object -ExpandProperty safename -Unique
 
     foreach ($safe in $uniqueSafes) {
 
+        Write-Host "[TRACE] Resolving owner for Safe: $safe"
+
         $pattern = "MARK_$safe*"
 
         try {
-            $groups = Get-ADGroup -Filter "Name -like '$pattern'" -Properties ManagedBy,Member -ErrorAction Stop
+            $groups = Get-ADGroup -Filter "Name -like '$pattern'" `
+                                  -Properties ManagedBy,Member `
+                                  -ErrorAction Stop
         }
         catch {
-            $errorLog += "[$safe] Failed to get AD groups: $_"
+            Write-Host "[ERROR] AD group lookup failed for $safe" -ForegroundColor Red
             $safeOwnerMap[$safe] = "ERROR_GETTING_GROUP"
             continue
         }
@@ -32,47 +57,50 @@ function Get-SafeNameOwners {
             continue
         }
 
-        # 1️⃣ Prefer group with ManagedBy
+        # 1️⃣ Prefer ManagedBy
         $groupWithManager = $groups | Where-Object ManagedBy | Select-Object -First 1
         if ($groupWithManager) {
             try {
-                $owner = Get-ADUser $groupWithManager.ManagedBy -Properties SamAccountName -ErrorAction Stop
+                $owner = Get-ADUser $groupWithManager.ManagedBy `
+                                   -Properties SamAccountName `
+                                   -ErrorAction Stop
                 $safeOwnerMap[$safe] = $owner.SamAccountName
+                continue
             }
             catch {
-                $errorLog += "[$safe] Failed to get ManagedBy user: $_"
                 $safeOwnerMap[$safe] = "ERROR_MANAGEDBY"
+                continue
             }
-            continue
         }
 
-        # 2️⃣ No ManagedBy → collect all members from all groups
+        # 2️⃣ Members fallback
         $allMembersDN = @()
         foreach ($group in $groups) {
             if ($group.Member) { $allMembersDN += $group.Member }
         }
 
-        # Unique members per SafeName
         $allMembersDN = $allMembersDN | Sort-Object -Unique
 
         if ($allMembersDN.Count -gt 0) {
             try {
-                $users = Get-ADUser -Identity $allMembersDN -Properties Title,Manager -ErrorAction Stop
+                $users = Get-ADUser -Identity $allMembersDN `
+                                   -Properties Title,Manager `
+                                   -ErrorAction Stop
             }
             catch {
-                $errorLog += "[$safe] Failed to get AD users from members: $_"
                 $safeOwnerMap[$safe] = "ERROR_GETTING_USERS"
                 continue
             }
 
-            # 2️⃣ Pick member with title
-            $titleOwner = $users | Where-Object { $_.Title -match '(?i)mgr|vp|avp|svp' } | Select-Object -First 1
+            $titleOwner = $users |
+                Where-Object { $_.Title -match '(?i)mgr|vp|avp|svp' } |
+                Select-Object -First 1
+
             if ($titleOwner) {
                 $safeOwnerMap[$safe] = $titleOwner.SamAccountName
                 continue
             }
 
-            # 3️⃣ Pick any member’s manager
             $managerDN = ($users | Where-Object Manager | Select-Object -First 1).Manager
             if ($managerDN) {
                 try {
@@ -81,19 +109,22 @@ function Get-SafeNameOwners {
                     continue
                 }
                 catch {
-                    $errorLog += "[$safe] Failed to get manager of member: $_"
                     $safeOwnerMap[$safe] = "ERROR_GETTING_MANAGER"
                     continue
                 }
             }
         }
 
-        # Absolute fallback
         $safeOwnerMap[$safe] = "OWNER_NOT_FOUND"
     }
 
-    # Expand back to all original records
-    $result = foreach ($row in $AllAccounts) {
+    # ==============================
+    # EXPAND TO BASE RESULT
+    # ==============================
+
+    Write-Host "[INFO] Building base dataset..."
+
+    $baseResult = foreach ($row in $AllAccounts) {
         [PSCustomObject]@{
             SafeName = $row.safename
             UserName = $row.username
@@ -102,21 +133,87 @@ function Get-SafeNameOwners {
         }
     }
 
-    # Export to CSV
-    try {
-        $result | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Force
-        Write-Host "CSV exported to $OutputCsvPath"
-    }
-    catch {
-        Write-Warning "Failed to export CSV: $_"
+    # ==============================
+    # CHECK OWNER_NOT_FOUND
+    # ==============================
+
+    $ownerNotFound = $baseResult | Where-Object { $_.Owner -eq 'OWNER_NOT_FOUND' }
+
+    if ($ownerNotFound.Count -eq 0) {
+        Write-Host "[INFO] All Safes have owners. Exporting CSV..."
+
+        $baseResult | Export-Csv $OutputCsvPath -NoTypeInformation -Force
+        Close-PASSession
+        return $baseResult
     }
 
-    # Optional: export error log if any
-    if ($errorLog.Count -gt 0) {
-        $errorLogPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($OutputCsvPath), "SafeNameOwnerErrors.log")
-        $errorLog | Out-File $errorLogPath -Force
-        Write-Warning "Some errors occurred. See log at $errorLogPath"
+    Write-Host "[WARNING] OWNER_NOT_FOUND count: $($ownerNotFound.Count)"
+
+    # ==============================
+    # APPLICATION LOOKUP (ONE CALL)
+    # ==============================
+
+    Write-Host "[INFO] Retrieving CyberArk applications..."
+    $applications = Get-PASApplication
+
+    $appDescLookup = @{}
+    foreach ($app in $applications) {
+        $appDescLookup[$app.AppID] = $app.Description
     }
 
-    return $result
+    # ==============================
+    # SAFE DESCRIPTION CACHE
+    # ==============================
+
+    $safeDescCache = @{}
+
+    # ==============================
+    # ENRICH OWNER_NOT_FOUND
+    # ==============================
+
+    Write-Host "[INFO] Enriching OWNER_NOT_FOUND records..."
+
+    $enrichedOwnerNotFound = foreach ($row in $ownerNotFound) {
+
+        Write-Host "[TRACE] Enriching Safe: $($row.SafeName)"
+
+        if (-not $safeDescCache.ContainsKey($row.SafeName)) {
+            try {
+                $safe = Get-PASSafe -SafeName $row.SafeName
+                $safeDescCache[$row.SafeName] = $safe.Description
+            }
+            catch {
+                Write-Host "[ERROR] Failed to retrieve Safe $($row.SafeName)" -ForegroundColor Red
+                $safeDescCache[$row.SafeName] = $null
+            }
+        }
+
+        [PSCustomObject]@{
+            SafeName  = $row.SafeName
+            UserName  = $row.UserName
+            Address   = $row.Address
+            Owner     = $row.Owner
+            SafeDesc  = $safeDescCache[$row.SafeName]
+            AppIDDesc = $appDescLookup[$row.SafeName]
+        }
+    }
+
+    # ==============================
+    # FINAL MERGE & EXPORT
+    # ==============================
+
+    Write-Host "[INFO] Merging final dataset..."
+
+    $finalResult = @(
+        $baseResult | Where-Object { $_.Owner -ne 'OWNER_NOT_FOUND' }
+        $enrichedOwnerNotFound
+    )
+
+    Write-Host "[INFO] Exporting final CSV to $OutputCsvPath"
+    $finalResult | Export-Csv $OutputCsvPath -NoTypeInformation -Force
+
+    Close-PASSession
+    Write-Host "[SUCCESS] Function completed successfully"
+
+    return $finalResult
 }
