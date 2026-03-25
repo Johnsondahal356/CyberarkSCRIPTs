@@ -1,219 +1,220 @@
-function Get-CyberArkSafeOwnersEnriched {
+Import-Module ActiveDirectory
 
-    param (
-        [Parameter(Mandatory = $true)]
-        [array]$AllAccounts,
+# ==========================
+# Configuration
+# ==========================
 
-        [Parameter(Mandatory = $false)]
-        [string]$OutputCsvPath = "C:\temp\FinalSafeOwners.csv",
-
-        [Parameter(Mandatory = $false)]
-        [string]$CyberArkBaseURI = "https://cyberark.company.com"
-    )
-
-    Write-Host "[INFO] Loading required modules..."
-    Import-Module ActiveDirectory -ErrorAction Stop
-    Import-Module PSPAS -ErrorAction Stop
-
-    # ==============================
-    # CYBERARK SESSION
-    # ==============================
-
-    Write-Host "[INFO] Connecting to CyberArk..."
-    New-PASSession -BaseURI $CyberArkBaseURI `
-                   -Credential (Get-Credential) `
-                   -Type RADIUS
-
-    # ==============================
-    # SAFE OWNER RESOLUTION (AD)
-    # ==============================
-
-    Write-Host "[INFO] Resolving Safe owners using AD..."
-
-    $safeOwnerMap = @{}
-    $errorLog = @()
-
-    $uniqueSafes = $AllAccounts | Select-Object -ExpandProperty safename -Unique
-
-    foreach ($safe in $uniqueSafes) {
-
-        Write-Host "[TRACE] Resolving owner for Safe: $safe"
-
-        $pattern = "MARK_$safe*"
-
-        try {
-            $groups = Get-ADGroup -Filter "Name -like '$pattern'" `
-                                  -Properties ManagedBy,Member `
-                                  -ErrorAction Stop
-        }
-        catch {
-            Write-Host "[ERROR] AD group lookup failed for $safe" -ForegroundColor Red
-            $safeOwnerMap[$safe] = "ERROR_GETTING_GROUP"
-            continue
-        }
-
-        if (-not $groups) {
-            $safeOwnerMap[$safe] = "NO_GROUP_FOUND"
-            continue
-        }
-
-        # 1️⃣ Prefer ManagedBy
-        $groupWithManager = $groups | Where-Object ManagedBy | Select-Object -First 1
-        if ($groupWithManager) {
-            try {
-                $owner = Get-ADUser $groupWithManager.ManagedBy `
-                                   -Properties SamAccountName `
-                                   -ErrorAction Stop
-                $safeOwnerMap[$safe] = $owner.SamAccountName
-                continue
-            }
-            catch {
-                $safeOwnerMap[$safe] = "ERROR_MANAGEDBY"
-                continue
-            }
-        }
-
-        # 2️⃣ Members fallback
-        $allMembersDN = @()
-        foreach ($group in $groups) {
-            if ($group.Member) { $allMembersDN += $group.Member }
-        }
-
-        $allMembersDN = $allMembersDN | Sort-Object -Unique
-
-        if ($allMembersDN.Count -gt 0) {
-            try {
-                $users = Get-ADUser -Identity $allMembersDN `
-                                   -Properties Title,Manager `
-                                   -ErrorAction Stop
-            }
-            catch {
-                $safeOwnerMap[$safe] = "ERROR_GETTING_USERS"
-                continue
-            }
-
-            $titleOwner = $users |
-                Where-Object { $_.Title -match '(?i)mgr|vp|avp|svp' } |
-                Select-Object -First 1
-
-            if ($titleOwner) {
-                $safeOwnerMap[$safe] = $titleOwner.SamAccountName
-                continue
-            }
-
-            $managerDN = ($users | Where-Object Manager | Select-Object -First 1).Manager
-            if ($managerDN) {
-                try {
-                    $mgr = Get-ADUser $managerDN -Properties SamAccountName -ErrorAction Stop
-                    $safeOwnerMap[$safe] = $mgr.SamAccountName
-                    continue
-                }
-                catch {
-                    $safeOwnerMap[$safe] = "ERROR_GETTING_MANAGER"
-                    continue
-                }
-            }
-        }
-
-        $safeOwnerMap[$safe] = "OWNER_NOT_FOUND"
+$Config = @{
+    TypeDescriptionMap = @{
+        "asd"  = "asd"
+        "asds"  = "assd"
+        "asdsa" = "asdasw"
     }
-
-    # ==============================
-    # EXPAND TO BASE RESULT
-    # ==============================
-
-    Write-Host "[INFO] Building base dataset..."
-
-    $baseResult = foreach ($row in $AllAccounts) {
-        [PSCustomObject]@{
-            SafeName = $row.safename
-            UserName = $row.username
-            Address  = $row.address
-            Owner    = $safeOwnerMap[$row.safename]
-        }
-    }
-
-    # ==============================
-    # CHECK OWNER_NOT_FOUND
-    # ==============================
-
-    $ownerNotFound = $baseResult | Where-Object { $_.Owner -eq 'OWNER_NOT_FOUND' }
-
-    if ($ownerNotFound.Count -eq 0) {
-        Write-Host "[INFO] All Safes have owners. Exporting CSV..."
-
-        $baseResult | Export-Csv $OutputCsvPath -NoTypeInformation -Force
-        Close-PASSession
-        return $baseResult
-    }
-
-    Write-Host "[WARNING] OWNER_NOT_FOUND count: $($ownerNotFound.Count)"
-
-    # ==============================
-    # APPLICATION LOOKUP (ONE CALL)
-    # ==============================
-
-    Write-Host "[INFO] Retrieving CyberArk applications..."
-    $applications = Get-PASApplication
-
-    $appDescLookup = @{}
-    foreach ($app in $applications) {
-        $appDescLookup[$app.AppID] = $app.Description
-    }
-
-    # ==============================
-    # SAFE DESCRIPTION CACHE
-    # ==============================
-
-    $safeDescCache = @{}
-
-    # ==============================
-    # ENRICH OWNER_NOT_FOUND
-    # ==============================
-
-    Write-Host "[INFO] Enriching OWNER_NOT_FOUND records..."
-
-    $enrichedOwnerNotFound = foreach ($row in $ownerNotFound) {
-
-        Write-Host "[TRACE] Enriching Safe: $($row.SafeName)"
-
-        if (-not $safeDescCache.ContainsKey($row.SafeName)) {
-            try {
-                $safe = Get-PASSafe -SafeName $row.SafeName
-                $safeDescCache[$row.SafeName] = $safe.Description
-            }
-            catch {
-                Write-Host "[ERROR] Failed to retrieve Safe $($row.SafeName)" -ForegroundColor Red
-                $safeDescCache[$row.SafeName] = $null
-            }
-        }
-
-        [PSCustomObject]@{
-            SafeName  = $row.SafeName
-            UserName  = $row.UserName
-            Address   = $row.Address
-            Owner     = $row.Owner
-            SafeDesc  = $safeDescCache[$row.SafeName]
-            AppIDDesc = $appDescLookup[$row.SafeName]
-        }
-    }
-
-    # ==============================
-    # FINAL MERGE & EXPORT
-    # ==============================
-
-    Write-Host "[INFO] Merging final dataset..."
-
-    $finalResult = @(
-        $baseResult | Where-Object { $_.Owner -ne 'OWNER_NOT_FOUND' }
-        $enrichedOwnerNotFound
-    )
-
-    Write-Host "[INFO] Exporting final CSV to $OutputCsvPath"
-    $finalResult | Export-Csv $OutputCsvPath -NoTypeInformation -Force
-
-    Close-PASSession
-    Write-Host "[SUCCESS] Function completed successfully"
-
-    return $finalResult
+    LogFile = "C:\Logs\AD_Admin_Update_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 }
+
+# ==========================
+# Logging
+# ==========================
+
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] - $Message"
+    Write-Output $logEntry
+    Add-Content -Path $Config.LogFile -Value $logEntry
+}
+
+# ==========================
+# Get Users
+# ==========================
+
+function Get-AllADUsers {
+    try {
+        Write-Log "Fetching AD users..."
+        return Get-ADUser -Filter * -Properties Description, adminDisplayName, Manager, SamAccountName
+    }
+    catch {
+        Write-Log "Failed to fetch AD users: $_" "ERROR"
+        throw
+    }
+}
+
+# ==========================
+# Parse Account
+# ==========================
+
+function Parse-Account {
+    param ([string]$SamAccountName)
+
+    if ($SamAccountName -notmatch "\.") { return $null }
+
+    $parts = $SamAccountName.Split(".")
+    if ($parts.Count -lt 2) { return $null }
+
+    return [PSCustomObject]@{
+        EMPID = $parts[0]
+        Type  = $parts[1]
+        PrivID = $SamAccountName
+    }
+}
+
+# ==========================
+# Get Expected Description
+# ==========================
+
+function Get-ExpectedDescription {
+    param ([string]$Type)
+
+    if ($Config.TypeDescriptionMap.ContainsKey($Type)) {
+        return $Config.TypeDescriptionMap[$Type]
+    }
+
+    return $null
+}
+
+# ==========================
+# Get Manager Sam
+# ==========================
+
+function Get-ManagerSamAccountName {
+    param ([string]$EMPID)
+
+    try {
+        $baseUser = Get-ADUser -Identity $EMPID -Properties Manager -ErrorAction Stop
+
+        if (-not $baseUser.Manager) {
+            Write-Log "Manager missing for $EMPID" "WARN"
+            return $null
+        }
+
+        $manager = Get-ADUser -Identity $baseUser.Manager -Properties SamAccountName -ErrorAction Stop
+        return $manager.SamAccountName
+    }
+    catch {
+        Write-Log "EMPID or Manager lookup failed for $EMPID : $_" "WARN"
+        return $null
+    }
+}
+
+# ==========================
+# Update Description
+# ==========================
+
+function Update-Description {
+    param (
+        $User,
+        [string]$ExpectedDescription
+    )
+
+    try {
+        if ($User.Description -ne $ExpectedDescription) {
+            Write-Log "Updating Description for $($User.SamAccountName) -> $ExpectedDescription"
+
+            Set-ADUser -Identity $User -Replace @{
+                Description = $ExpectedDescription
+            }
+
+            Write-Log "Description updated for $($User.SamAccountName)"
+        }
+    }
+    catch {
+        Write-Log "Failed to update Description for $($User.SamAccountName): $_" "ERROR"
+    }
+}
+
+# ==========================
+# Update AdminDisplayName
+# ==========================
+
+function Update-AdminDisplayName {
+    param (
+        $User,
+        [string]$ManagerSam
+    )
+
+    try {
+        if ([string]::IsNullOrEmpty($User.adminDisplayName) -or $User.adminDisplayName -ne $ManagerSam) {
+
+            Write-Log "Updating adminDisplayName for $($User.SamAccountName) -> $ManagerSam"
+
+            Set-ADUser -Identity $User -Replace @{
+                adminDisplayName = $ManagerSam
+            }
+
+            Write-Log "adminDisplayName updated for $($User.SamAccountName)"
+        }
+    }
+    catch {
+        Write-Log "Failed to update adminDisplayName for $($User.SamAccountName): $_" "ERROR"
+    }
+}
+
+# ==========================
+# Process User
+# ==========================
+
+function Process-User {
+    param ($User)
+
+    try {
+        $parsed = Parse-Account -SamAccountName $User.SamAccountName
+        if (-not $parsed) { return }
+
+        Write-Log "Processing $($parsed.PrivID)"
+
+        $expectedDescription = Get-ExpectedDescription -Type $parsed.Type
+        if (-not $expectedDescription) {
+            Write-Log "Unknown type $($parsed.Type)" "WARN"
+            return
+        }
+
+        # Always ensure Description is correct
+        Update-Description -User $User -ExpectedDescription $expectedDescription
+
+        # Try to get manager
+        $managerSam = Get-ManagerSamAccountName -EMPID $parsed.EMPID
+
+        # If EMPID or manager missing → skip adminDisplayName
+        if (-not $managerSam) {
+            Write-Log "Skipping adminDisplayName update for $($parsed.PrivID) due to missing EMPID/Manager" "WARN"
+            return
+        }
+
+        # Otherwise update adminDisplayName
+        Update-AdminDisplayName -User $User -ManagerSam $managerSam
+    }
+    catch {
+        Write-Log "Error processing $($User.SamAccountName): $_" "ERROR"
+    }
+}
+
+# ==========================
+# Main
+# ==========================
+
+function Start-ADAdminSync {
+    try {
+        Write-Log "===== Script Started ====="
+
+        $users = Get-AllADUsers
+
+        foreach ($user in $users) {
+            Process-User -User $user
+        }
+
+        Write-Log "===== Script Completed ====="
+    }
+    catch {
+        Write-Log "Fatal error: $_" "ERROR"
+    }
+}
+
+# ==========================
+# Run
+# ==========================
+
+Start-ADAdminSync
